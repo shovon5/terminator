@@ -3560,21 +3560,18 @@ bool isReservedShortcut(unsigned int modifiers, KeySym key)
     return false;
 }
 
+// Default bindings: written to a new ~/.terminator, and also used for any
+// action that an existing file does not bind (so e.g. Ctrl+R always works).
+const char *const DEFAULT_HOTKEYS[][2] = {
+    {"Ctrl+A", "line-start"}, {"Ctrl+E", "line-end"}, {"Ctrl+U", "kill-to-start"},
+    {"Ctrl+K", "kill-to-end"}, {"Alt+BackSpace", "delete-word"}, {"Ctrl+L", "clear-screen"},
+    {"Ctrl+R", "reverse-search"}};
+
 bool writeDefaultHotkeyConfig(const std::string &path)
 {
     std::ofstream file(path);
-
-    if (!file)
-        return false;
-
-    file << "bind Ctrl+A line-start\n";
-    file << "bind Ctrl+E line-end\n";
-    file << "bind Ctrl+U kill-to-start\n";
-    file << "bind Ctrl+K kill-to-end\n";
-    file << "bind Alt+BackSpace delete-word\n";
-    file << "bind Ctrl+L clear-screen\n";
-    file << "bind Ctrl+R reverse-search\n";
-
+    for (const auto &binding : DEFAULT_HOTKEYS)
+        file << "bind " << binding[0] << " " << binding[1] << "\n";
     return static_cast<bool>(file);
 }
 
@@ -3737,7 +3734,7 @@ void adjustSelectionForClosedTab(int closedIndex)
         textSelection.tabIndex--;
 }
 
-bool loadHotkeyConfiguration(TerminalTab &tab)
+bool loadHotkeyFile(TerminalTab &tab)
 {
     const char *home = getenv("HOME");
 
@@ -3818,6 +3815,31 @@ bool loadHotkeyConfiguration(TerminalTab &tab)
     return validCount > 0;
 }
 
+bool loadHotkeyConfiguration(TerminalTab &tab)
+{
+    bool loaded = loadHotkeyFile(tab);
+    // Keep the default for every action the file does not bind, unless the
+    // user already gave that key to another action.
+    for (const auto &binding : DEFAULT_HOTKEYS)
+    {
+        unsigned int modifiers = 0;
+        KeySym key = NoSymbol;
+        std::string error;
+        bool used = false;
+        for (const Hotkey &h : hotkeys)
+            if (h.action == binding[1])
+                used = true;
+        if (used || !parseHotkeyCombo(binding[0], modifiers, key, error))
+            continue;
+        for (const Hotkey &h : hotkeys)
+            if (h.key == key && h.modifiers == modifiers)
+                used = true;
+        if (!used)
+            hotkeys.push_back({modifiers, key, binding[1]});
+    }
+    return loaded;
+}
+
 // Length of the longest common substring of a and b.
 size_t longestCommonSubstring(const std::string &a, const std::string &b)
 {
@@ -3836,8 +3858,9 @@ size_t longestCommonSubstring(const std::string &a, const std::string &b)
 }
 
 
-// Ctrl+R: scan from newest to oldest for an exact match; if there is none,
-// pick the entry with the longest common substring longer than 2 characters.
+// Ctrl+R: scan from newest to oldest for an exact match, then for an entry
+// containing the typed text, then for the entry with the longest common
+// substring longer than 2 characters.
 // Pressing Ctrl+R again continues with older entries; if there is no older
 // match, the current one is kept (like bash).
 void updateReverseSearch(TerminalTab &tab, bool older)
@@ -3852,6 +3875,10 @@ void updateReverseSearch(TerminalTab &tab, bool older)
     {
         for (int i = start - 1; i >= 0 && found < 0; --i)
             if (history[i] == tab.reverseSearchQuery)
+                found = i;
+        // Newest entry that contains what was typed (so "pw" finds "pwd").
+        for (int i = start - 1; i >= 0 && found < 0; --i)
+            if (history[i].find(tab.reverseSearchQuery) != std::string::npos)
                 found = i;
         if (found < 0)
         {
