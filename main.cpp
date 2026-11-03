@@ -363,6 +363,10 @@ bool appendSharedHistory(const std::string &command)
     return true;
 }
 
+// A multi-line command is stored on one line of the history file: each
+// embedded newline is written as 0x1F, a byte typed commands never contain.
+const char HISTORY_NEWLINE_MARK = '\x1f';
+
 std::string getHistoryFilePath()
 {
     const char *home = getenv("HOME");
@@ -380,7 +384,7 @@ void loadCommandHistory()
     {
         if (line.empty())
             continue;
-
+        std::replace(line.begin(), line.end(), HISTORY_NEWLINE_MARK, '\n');
         appendSharedHistory(line);
     }
 }
@@ -398,7 +402,11 @@ void saveCommandHistory()
         if (!file)
             return;
         for (const std::string &command : historySnapshot())
-            file << command << '\n';
+        {
+            std::string stored = command;
+            std::replace(stored.begin(), stored.end(), '\n', HISTORY_NEWLINE_MARK);
+            file << stored << '\n';
+        }
         if (!file)
         {
             unlink(tempPath.c_str());
@@ -4049,11 +4057,12 @@ int main(int argc, char *argv[])
     // ./terminator                      -> Thread Mode (default)
     // ./terminator useProcess = True    -> Process Mode
     // (also accepted: useProcess=True, --mode thread|process)
+    // Spaces are ignored, so "useProcess = True" works as 3 words or quoted.
     std::string arguments;
     for (int i = 1; i < argc; ++i)
-        arguments += argv[i];
-    for (char &c : arguments)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (const char *c = argv[i]; *c; ++c)
+            if (!std::isspace(static_cast<unsigned char>(*c)))
+                arguments += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
     if (arguments.empty() || arguments == "useprocess=false" || arguments == "--modethread" ||
         arguments == "--mode=thread")
         executionMode = ExecutionMode::Thread;
