@@ -2218,6 +2218,7 @@ struct TerminalTab
     bool reverseSearchActive = false;
     std::string reverseSearchQuery;
     int reverseSearchMatch = -1;
+    std::string reverseSearchMatchText;   // the match itself: indexes shift when the ring is full
 
     std::string commandBuffer;
     bool continuationMode = false;
@@ -2881,11 +2882,10 @@ void drawScreen(Display *display, Window window, GC gc, int screen,
 
     if (tab.reverseSearchActive)
     {
-        prompt = "(reverse-i-search)`" + tab.reverseSearchQuery + "': ";
-        std::vector<std::string> history = historySnapshot();
-        if (tab.reverseSearchMatch >= 0 &&
-            tab.reverseSearchMatch < static_cast<int>(history.size()))
-            displayedInput = history[tab.reverseSearchMatch];
+        bool failed = !tab.reverseSearchQuery.empty() && tab.reverseSearchMatchText.empty();
+        prompt = std::string(failed ? "(failed reverse-i-search)`" : "(reverse-i-search)`") +
+                 tab.reverseSearchQuery + "': ";
+        displayedInput = tab.reverseSearchMatchText;
     }
     else if (tab.commandRunning)
     {
@@ -3838,33 +3838,42 @@ size_t longestCommonSubstring(const std::string &a, const std::string &b)
 
 // Ctrl+R: scan from newest to oldest for an exact match; if there is none,
 // pick the entry with the longest common substring longer than 2 characters.
-// Pressing Ctrl+R again continues with older entries.
+// Pressing Ctrl+R again continues with older entries; if there is no older
+// match, the current one is kept (like bash).
 void updateReverseSearch(TerminalTab &tab, bool older)
 {
     std::vector<std::string> history = historySnapshot();
     int start = static_cast<int>(history.size());
     if (older && tab.reverseSearchMatch >= 0)
-        start = tab.reverseSearchMatch;
+        start = std::min(start, tab.reverseSearchMatch);
 
-    tab.reverseSearchMatch = -1;
-    if (tab.reverseSearchQuery.empty())
-        return;
-    for (int i = start - 1; i >= 0; --i)
-        if (history[i] == tab.reverseSearchQuery)
-        {
-            tab.reverseSearchMatch = i;
-            return;
-        }
-    size_t bestLength = 2;
-    for (int i = start - 1; i >= 0; --i)
+    int found = -1;
+    if (!tab.reverseSearchQuery.empty())
     {
-        size_t length = longestCommonSubstring(history[i], tab.reverseSearchQuery);
-        if (length > bestLength)
+        for (int i = start - 1; i >= 0 && found < 0; --i)
+            if (history[i] == tab.reverseSearchQuery)
+                found = i;
+        if (found < 0)
         {
-            bestLength = length;
-            tab.reverseSearchMatch = i;
+            size_t bestLength = 2;   // must share more than 2 characters
+            int best = -1;
+            for (int i = start - 1; i >= 0; --i)
+            {
+                size_t length = longestCommonSubstring(history[i], tab.reverseSearchQuery);
+                if (length > bestLength)
+                {
+                    bestLength = length;
+                    best = i;
+                }
+            }
+            found = best;
         }
     }
+
+    if (found < 0 && older && !tab.reverseSearchMatchText.empty())
+        return;   // nothing older: keep showing the current match
+    tab.reverseSearchMatch = found;
+    tab.reverseSearchMatchText = found >= 0 ? history[found] : "";
 }
 
 
@@ -3890,6 +3899,22 @@ bool isReverseSearchHotkey(KeySym key, unsigned int state)
     return false;
 }
 
+void finishReverseSearch(TerminalTab &tab, bool acceptMatch)
+{
+    if (acceptMatch && !tab.reverseSearchMatchText.empty())
+    {
+        size_t n = std::min(tab.reverseSearchMatchText.size(), static_cast<size_t>(MAX_LINE_LENGTH - 1));
+        memcpy(tab.inputBuffer, tab.reverseSearchMatchText.data(), n);
+        tab.inputBuffer[n] = '\0';
+        tab.inputLength = tab.cursorPosition = static_cast<int>(n);
+    }
+    tab.reverseSearchActive = false;
+    tab.reverseSearchQuery.clear();
+    tab.reverseSearchMatch = -1;
+    tab.reverseSearchMatchText.clear();
+}
+
+// Returns true when the key was fully handled by the search.
 bool handleReverseSearchKey(TerminalTab &tab, KeySym key,
                             const char *text, int length, bool control,
                             unsigned int state)
@@ -3897,40 +3922,19 @@ bool handleReverseSearchKey(TerminalTab &tab, KeySym key,
     if (!tab.reverseSearchActive)
         return false;
 
-    if (key == XK_Escape ||
-        (control && (key == XK_g || key == XK_G ||
-                     key == XK_c || key == XK_C)))
-    {
-        tab.reverseSearchActive = false;
-        tab.reverseSearchQuery.clear();
-        tab.reverseSearchMatch = -1;
+    // Pressing Shift/Ctrl/Alt alone also sends a KeyPress: keep searching.
+    if (IsModifierKey(key))
         return true;
-    }
 
-    if (key == XK_Return || key == XK_KP_Enter)
+    if (key == XK_Escape || (control && (key == XK_g || key == XK_G || key == XK_c || key == XK_C)))
     {
-        std::vector<std::string> history = historySnapshot();
-        if (tab.reverseSearchMatch >= 0 &&
-            tab.reverseSearchMatch < static_cast<int>(history.size()))
-        {
-            const std::string &match = history[tab.reverseSearchMatch];
-            size_t n = match.size();
-            if (n >= MAX_LINE_LENGTH)
-                n = MAX_LINE_LENGTH - 1;
-            memcpy(tab.inputBuffer, match.data(), n);
-            tab.inputBuffer[n] = '\0';
-            tab.inputLength = static_cast<int>(n);
-            tab.cursorPosition = tab.inputLength;
-        }
-        tab.reverseSearchActive = false;
-        tab.reverseSearchQuery.clear();
-        tab.reverseSearchMatch = -1;
+        finishReverseSearch(tab, false);   // cancel: the input line is unchanged
         return true;
     }
 
     if (isReverseSearchHotkey(key, state))
     {
-        updateReverseSearch(tab, true);
+        updateReverseSearch(tab, true);    // next older match
         return true;
     }
 
@@ -3942,19 +3946,17 @@ bool handleReverseSearchKey(TerminalTab &tab, KeySym key,
         return true;
     }
 
-    if (length > 0 && !control)
+    if (length > 0 && !control && static_cast<unsigned char>(text[0]) >= 32 && text[0] != 127)
     {
-        for (int i = 0; i < length; ++i)
-        {
-            unsigned char ch = static_cast<unsigned char>(text[i]);
-            if (ch >= 32 && ch != 127)
-                tab.reverseSearchQuery += text[i];
-        }
+        tab.reverseSearchQuery.append(text, static_cast<size_t>(length));
         updateReverseSearch(tab, false);
         return true;
     }
 
-    return true;
+    // Any other key (Enter, arrows, Home/End, Tab, Ctrl+A/E/K ... hotkeys):
+    // accept the match into the input line, then let the key act normally.
+    finishReverseSearch(tab, true);
+    return key == XK_Return || key == XK_KP_Enter;   // Enter only accepts the match
 }
 
 bool executeConfiguredHotkey(Display *display,
@@ -4005,6 +4007,7 @@ bool executeConfiguredHotkey(Display *display,
             tab.reverseSearchActive = true;
             tab.reverseSearchQuery.clear();
             tab.reverseSearchMatch = -1;
+            tab.reverseSearchMatchText.clear();
         }
 
         return true;
@@ -4406,7 +4409,8 @@ int main(int argc, char *argv[])
                     clearInputLine(tab);
                 }
             }
-            else if (controlPressed && (keysym == XK_d || keysym == XK_D))
+            else if (controlPressed && (keysym == XK_d || keysym == XK_D) &&
+                     !tabs[currentTab].reverseSearchActive)
             {
                 TerminalTab &tab = tabs[currentTab];
                 if (tab.commandRunning)
@@ -4567,6 +4571,6 @@ int main(int argc, char *argv[])
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
     XCloseDisplay(display);
-    
+
     return 0;
 }
