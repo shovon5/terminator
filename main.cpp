@@ -4567,6 +4567,6 @@ int main(int argc, char *argv[])
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
     XCloseDisplay(display);
-    //ffj
+    
     return 0;
 }
