@@ -44,7 +44,9 @@
 
 extern char **environ;
 
-const int MAX_LINES = 26;
+const int MAX_LINES = 400;
+const int VISIBLE_SCREEN_ROWS = 25;
+const int MOUSE_SCROLL_LINES = 3;
 const int MAX_LINE_LENGTH = 1000;
 const int MAX_SCREEN_LINE_LENGTH = MAX_LINE_LENGTH + 32;
 const int MAX_TABS = 10;
@@ -363,10 +365,6 @@ bool appendSharedHistory(const std::string &command)
     return true;
 }
 
-// A multi-line command is stored on one line of the history file: each
-// embedded newline is written as 0x1F, a byte typed commands never contain.
-const char HISTORY_NEWLINE_MARK = '\x1f';
-
 std::string getHistoryFilePath()
 {
     const char *home = getenv("HOME");
@@ -384,7 +382,7 @@ void loadCommandHistory()
     {
         if (line.empty())
             continue;
-        std::replace(line.begin(), line.end(), HISTORY_NEWLINE_MARK, '\n');
+
         appendSharedHistory(line);
     }
 }
@@ -402,11 +400,7 @@ void saveCommandHistory()
         if (!file)
             return;
         for (const std::string &command : historySnapshot())
-        {
-            std::string stored = command;
-            std::replace(stored.begin(), stored.end(), '\n', HISTORY_NEWLINE_MARK);
-            file << stored << '\n';
-        }
+            file << command << '\n';
         if (!file)
         {
             unlink(tempPath.c_str());
@@ -2239,6 +2233,7 @@ struct TerminalTab
 
     char screenBuffer[MAX_LINES][MAX_SCREEN_LINE_LENGTH] = {};
     int screenLineCount = 0;
+    int scrollOffset = 0; // number of lines scrolled back from the newest output
 };
 
 bool sendWorkerMessage(TerminalTab &tab, WorkerMessageType type,
@@ -2408,21 +2403,20 @@ void addScreenLine(TerminalTab &tab, const char *line)
 {
     if (tab.screenLineCount >= MAX_LINES)
     {
-        // Rows are about to shift, so a stored selection would point at the
-        // wrong text. Drop it.
+        // Drop the oldest line only when the scrollback limit is reached.
         textSelection.active = false;
         textSelection.dragging = false;
-
         for (int i = 0; i < MAX_LINES - 1; i++)
             strcpy(tab.screenBuffer[i], tab.screenBuffer[i + 1]);
-
         tab.screenLineCount = MAX_LINES - 1;
     }
 
     snprintf(tab.screenBuffer[tab.screenLineCount],
              MAX_SCREEN_LINE_LENGTH, "%s", line);
-
     tab.screenLineCount++;
+
+    // New output follows the live bottom unless the user scrolls up again.
+    tab.scrollOffset = 0;
 }
 void adjustSelectionForClosedTab(int closedIndex);
 
@@ -2833,13 +2827,18 @@ void drawScreen(Display *display, Window window, GC gc, int screen,
 
     const int textX = 20;
     int textY = CONTENT_START_Y;
+    const int firstVisibleRow = std::max(
+        0, tab.screenLineCount - VISIBLE_SCREEN_ROWS - tab.scrollOffset);
+    const int visibleLineCount = std::min(
+        VISIBLE_SCREEN_ROWS, tab.screenLineCount - firstVisibleRow);
 
     XSetForeground(display, gc, BlackPixel(display, screen));
 
-    for (int i = 0; i < tab.screenLineCount; i++)
+    for (int visibleRow = 0; visibleRow < visibleLineCount; ++visibleRow)
     {
+        int i = firstVisibleRow + visibleRow;
         int length = static_cast<int>(strlen(tab.screenBuffer[i]));
-        int y = textY + i * LINE_HEIGHT;
+        int y = textY + visibleRow * LINE_HEIGHT;
         int begin = -1;
         int end = -1;
 
@@ -2883,7 +2882,7 @@ void drawScreen(Display *display, Window window, GC gc, int screen,
         }
     }
 
-    textY += tab.screenLineCount * LINE_HEIGHT;
+    textY += visibleLineCount * LINE_HEIGHT;
 
     std::string prompt;
     std::string displayedInput;
@@ -3666,8 +3665,15 @@ int selectionPositionFromMouse(const TerminalTab &tab, int x, int y)
     int col = (x - 20 + TERMINAL_CHAR_WIDTH / 2) / TERMINAL_CHAR_WIDTH;
 
     if (row < 0) row = 0;
-    if (row >= tab.screenLineCount)
-        row = tab.screenLineCount > 0 ? tab.screenLineCount - 1 : 0;
+    int firstVisibleRow = std::max(
+        0, tab.screenLineCount - VISIBLE_SCREEN_ROWS - tab.scrollOffset);
+    int visibleLineCount = std::min(
+        VISIBLE_SCREEN_ROWS, tab.screenLineCount - firstVisibleRow);
+    if (visibleLineCount <= 0)
+        return 0;
+    if (row >= visibleLineCount)
+        row = visibleLineCount - 1;
+    row += firstVisibleRow;
 
     int lineLength = row < tab.screenLineCount
                          ? static_cast<int>(strlen(tab.screenBuffer[row])) : 0;
@@ -4057,12 +4063,11 @@ int main(int argc, char *argv[])
     // ./terminator                      -> Thread Mode (default)
     // ./terminator useProcess = True    -> Process Mode
     // (also accepted: useProcess=True, --mode thread|process)
-    // Spaces are ignored, so "useProcess = True" works as 3 words or quoted.
     std::string arguments;
     for (int i = 1; i < argc; ++i)
-        for (const char *c = argv[i]; *c; ++c)
-            if (!std::isspace(static_cast<unsigned char>(*c)))
-                arguments += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+        arguments += argv[i];
+    for (char &c : arguments)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (arguments.empty() || arguments == "useprocess=false" || arguments == "--modethread" ||
         arguments == "--mode=thread")
         executionMode = ExecutionMode::Thread;
@@ -4291,6 +4296,21 @@ int main(int argc, char *argv[])
         }
         else if (event.type == ButtonPress)
         {
+            // X11 mouse wheel: Button4 scrolls up, Button5 scrolls down.
+            if (event.xbutton.button == Button4 || event.xbutton.button == Button5)
+            {
+                TerminalTab &tab = tabs[currentTab];
+                int maxScroll = std::max(0, tab.screenLineCount - VISIBLE_SCREEN_ROWS);
+                if (event.xbutton.button == Button4)
+                    tab.scrollOffset = std::min(maxScroll,
+                                                tab.scrollOffset + MOUSE_SCROLL_LINES);
+                else
+                    tab.scrollOffset = std::max(0,
+                                                tab.scrollOffset - MOUSE_SCROLL_LINES);
+                redraw();
+                continue;
+            }
+
             int x = event.xbutton.x;
             int y = event.xbutton.y;
 
